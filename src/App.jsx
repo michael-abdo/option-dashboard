@@ -83,6 +83,19 @@ function logWithTimestamp(...args) {
   console.log(`[${timestamp}]`, ...args);
 }
 
+async function fetchWithRetry(url, { retries = 3, backoff = 500 } = {}) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const res = await fetch(url);
+    if (res.ok) return res;
+    if (attempt < retries && (res.status >= 500 || res.status === 429)) {
+      logWithTimestamp(`[RETRY] ${url} returned ${res.status}, retrying in ${backoff}ms (attempt ${attempt + 1}/${retries})`);
+      await new Promise(r => setTimeout(r, backoff * (attempt + 1)));
+      continue;
+    }
+    throw new Error(`${res.status}: ${await res.text()}`);
+  }
+}
+
 function getDefaultStartTime() {
   try {
     const now = new Date();
@@ -240,17 +253,27 @@ function App() {
   const nqDisabled = false;
 
   useEffect(() => {
+    let cancelled = false;
     const loadInitial = async () => {
       try {
         logWithTimestamp('[APP] Loading initial data from:', API_BASE);
-        await Promise.all([fetchChains(), fetchMetrics(), fetchPresets()]);
+        const results = await Promise.allSettled([fetchChains(), fetchMetrics(), fetchPresets()]);
+        if (cancelled) return;
+        const failures = results.filter(r => r.status === 'rejected');
+        if (failures.length) {
+          const msgs = failures.map(f => f.reason?.message || String(f.reason));
+          console.error('[APP] Some initial loads failed:', msgs);
+          setError(`Failed to load: ${msgs.join('; ')}`);
+        }
         setLastUpdated(new Date().toISOString());
       } catch (err) {
+        if (cancelled) return;
         console.error('[APP] Failed to load initial data:', err);
         setError(`Failed to refresh data: ${err.message}`);
       }
     };
     loadInitial();
+    return () => { cancelled = true; };
   }, []);
 
   useEffect(() => {
@@ -297,10 +320,7 @@ function App() {
   // Removed automatic smart default - now handled by instrument selection
 
   const fetchChains = async () => {
-    const res = await fetch(`${API_BASE}/chains-detailed`);
-    if (!res.ok) {
-      throw new Error(await res.text());
-    }
+    const res = await fetchWithRetry(`${API_BASE}/chains-detailed`);
     const data = await res.json();
     logWithTimestamp('[APP] Fetched chains with expiration:', data.slice(0, 3));
     setChains(data);
@@ -345,10 +365,7 @@ function App() {
   };
 
   const fetchMetrics = async () => {
-    const res = await fetch(`${API_BASE}/metrics`);
-    if (!res.ok) {
-      throw new Error(await res.text());
-    }
+    const res = await fetchWithRetry(`${API_BASE}/metrics`);
     const data = await res.json();
     setMetrics(data);
     if (data.length && !data.includes(selectedMetric)) {
@@ -357,10 +374,7 @@ function App() {
   };
 
   const fetchPresets = async () => {
-    const res = await fetch(`${API_BASE}/presets`);
-    if (!res.ok) {
-      throw new Error(await res.text());
-    }
+    const res = await fetchWithRetry(`${API_BASE}/presets`);
     const data = await res.json();
     setPresets(data);
     // Don't auto-select a preset - wait for user action or auto-load
@@ -1265,6 +1279,19 @@ function App() {
         </div>
       </header>
 
+          {error && (
+            <div className="error" style={{ margin: '10px 0', padding: '12px 16px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+              <span>{error}</span>
+              <button
+                type="button"
+                onClick={() => { setError(''); window.location.reload(); }}
+                style={{ marginLeft: '12px', padding: '4px 12px', cursor: 'pointer', background: '#ff7043', color: '#fff', border: 'none', borderRadius: '4px' }}
+              >
+                Retry
+              </button>
+            </div>
+          )}
+
           <section className="controls">
             <label>
               Instrument
@@ -1561,8 +1588,6 @@ function App() {
               </table>
             </section>
           )}
-
-          {error && <div className="error">{error}</div>}
 
           <section className="chart">
             {loading ? (
